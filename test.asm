@@ -399,6 +399,7 @@ start:
     db 0FFh
     db 00011110b
     dw 1234h
+conditional_jumps4:
 
     ; ret1
     retn
@@ -408,6 +409,7 @@ start:
     retf
     ; ret4
     retf 15h
+conditional_jumps2:
 
     ; jmp1
     jmp conditional_jumps
@@ -416,13 +418,17 @@ start:
     jmp conditional_jumps
     ; jmp2
     jmp start
+test1:
     ; jmp3
     jmp ax
+test2:
     jmp [TT]
+test3:
     ; jmp4
     db 0EAh
     dw 1234h
     dw 4321h
+test4:
     ; call5
     db 0FFh
     db 00101110b
@@ -431,25 +437,28 @@ start:
     ; conditional jumps
 conditional_jumps:
     ja conditional_jumps
-    jae conditional_jumps
-    jb conditional_jumps
-    jbe conditional_jumps
+    jae conditional_jumps2
+    jb conditional_jumps3
+    jbe conditional_jumps4
     je conditional_jumps
     jcxz conditional_jumps
     jg conditional_jumps
     jge conditional_jumps
     jl conditional_jumps
+test5:
     jle conditional_jumps
-    jne conditional_jumps
-    jno conditional_jumps
-    jnp conditional_jumps
-    jp conditional_jumps
-    jo conditional_jumps
-    jns conditional_jumps
-    js conditional_jumps
+test6:
+    jne test7
+test7:
+    jno test1
+    jnp test2
+    jp test3
+    jo test4
+    jns test5
+    js test6
 
     ; loops
-    loop conditional_jumps
+    loop test_label
     loope conditional_jumps
     loopne conditional_jumps
     
@@ -457,7 +466,7 @@ conditional_jumps:
     int 34h
     ; iret
     iret
-
+test_label:
     ; flag control
     clc
     stc
@@ -466,7 +475,7 @@ conditional_jumps:
     std
     cli
     sti
-
+conditional_jumps3:
     ; hlt
     hlt
     ; wait
