@@ -11,6 +11,7 @@ Options:
 -a         Output addresses.
 -c         Output code segment only.
 -l         Output generated labels.
+-n         Remove NOP that is generated after JMP. Use if JMP is out of range for this reason.
 -d         Output numbers in decimal.
 ```
 

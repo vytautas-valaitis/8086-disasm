@@ -217,7 +217,8 @@ enum_types enum {
     t_label_int, t_label_int_close, t_label_ext,
     t_sreg16,
     t_one,
-    t_esc
+    t_esc,
+    t_exp8
 }
 s_instr struc ; everything is dw to keep struct aligned to a power of 2 for faster mul
     s_mnemonic dw 0
@@ -343,7 +344,7 @@ s_instr<ins_jg, f_none, t_label_int_close, t_none> ; jg 7Fh
 s_instr<ins_dup_80_83, f_dup, t_modrm8, t_imm8> ; dup_80_83 80h
 s_instr<ins_dup_80_83, f_dup, t_modrm16, t_imm16> ; dup_80_83 81h
 s_instr<ins_dup_80_83, f_dup, t_modrm8, t_imm8> ; dup_80_83 82h
-s_instr<ins_dup_80_83, f_dup, t_modrm16, t_imm8> ; dup_80_83 83h
+s_instr<ins_dup_80_83, f_dup, t_modrm16, t_exp8> ; dup_80_83 83h
 s_instr<ins_test, f_modregrm, t_reg8, t_modrm8> ; test1 84h
 s_instr<ins_test, f_modregrm, t_reg16, t_modrm16> ; test1 85h
 s_instr<ins_xchg, f_modregrm, t_reg8, t_modrm8> ; xchg1 86h
@@ -488,13 +489,15 @@ db "-h,-?      Display this help screen.", 0Ah
 db "-o [name]  Output file name. Defaults to 'ASMOUT.ASM'.", 0Ah
 db "-a         Output addresses.", 0Ah
 db "-c         Output code segment only.", 0Ah
-db "-l         Output generated labels. (TODO)", 0Ah
+db "-l         Output generated labels.", 0Ah
+db "-n         Remove NOP that is generated after JMP. Use if JMP is out of range for this reason.", 0Ah
 db "-d         Output numbers in decimal.", 0Ah
 string_endl_dollar db 0Dh, 0Ah, 24h
 arg_addresses db 0
 arg_code_only db 0
 arg_labels    db 0
 arg_use_dec   db 0
+arg_jmp_nop   db 0
 error_opc_invalid db "ERROR: Invalid instruction.$"
 error_args_no_input_file   db "ERROR: No input file passed.$"
 error_args_no_output_file  db "ERROR: No output file passed.$"
@@ -576,6 +579,8 @@ decode_arg proc
     je @@arg_code_only
     cmp al, 'l'
     je @@arg_labels
+    cmp al, 'n'
+    je @@arg_jmp_nop
     cmp al, 'd'
     je @@arg_use_dec
 
@@ -605,6 +610,9 @@ decode_arg proc
         jmp @@check_next_arg
     @@arg_labels:
         mov [arg_labels], 1
+        jmp @@check_next_arg
+    @@arg_jmp_nop:
+        mov [arg_jmp_nop], 1
         jmp @@check_next_arg
     @@arg_use_dec:
         mov [arg_use_dec], 1
@@ -1148,6 +1156,17 @@ dissasemble proc
 
         call get_byte
 
+        ; remove NOP after close JMP
+        cmp byte ptr [arg_jmp_nop], 0
+        je @@skip_jmp_nop
+        cmp byte ptr [var_opc_byte], 0EBh ; opc_byte from previous iteration
+        jne @@skip_jmp_nop
+        cmp byte ptr [var_byte], 90h
+        jne @@skip_jmp_nop
+        mov byte ptr [var_opc_byte], 0 ; reset so this does not remove any more NOPs
+        jmp @@whileloop
+        @@skip_jmp_nop:
+
         jmp @@skip_break
         @@break_relative_range1: ; fix for jump out of range
         jmp @@break_relative_range2
@@ -1543,8 +1562,6 @@ decode_labels proc ; INPUT: ah=instr_operand. OUTPUT: dl=0 if nothing found, els
         add ax, [var_global_index]
         cmp [arg_labels], 0
         je @@no_label2
-        lea si, str_label
-        call write_dollar_string
         ; if label is start, print differently
         cmp ax, [var_entry_point]
         jne @@print_label2
@@ -1552,6 +1569,8 @@ decode_labels proc ; INPUT: ah=instr_operand. OUTPUT: dl=0 if nothing found, els
         call write_dollar_string
         jmp @@exit
         @@print_label2:
+        lea si, str_label
+        call write_dollar_string
         @@no_label2:
         call write_number_word
         jmp @@exit        
@@ -1718,6 +1737,10 @@ decode_f_modregrm proc ; INPUT: ah=instr_operand, al=addr_byte
     je @@type_modrm16
     cmp ah, t_sreg16
     je @@type_sreg16
+    cmp ah, t_exp8
+    jne @@not_type_exp8
+    jmp @@type_exp8
+    @@not_type_exp8:
     ; unknown, exit
     call file_print
     m_print_string error_opc_invalid
@@ -1767,6 +1790,11 @@ decode_f_modregrm proc ; INPUT: ah=instr_operand, al=addr_byte
         mov si, [bx] 
         call write_dollar_string
         jmp @@exit
+    @@type_exp8:
+        call get_byte
+        mov al, byte ptr [var_byte]
+        cbw
+        call write_number_word
 
     @@exit:
     pop dx bx si ax
@@ -1999,7 +2027,11 @@ labelextr_decode_f_modregrm proc ; INPUT: ah=instr_operand, al=addr_byte
     cmp ah, t_modrm8
     je @@decode
     cmp ah, t_modrm16
+    je @@decode
+    cmp ah, t_exp8
     jne @@exit
+    call get_byte
+    jmp @@exit
     @@decode:
         mov ah, al
         and ah, 111b ; rm
@@ -2221,50 +2253,5 @@ exit:
     mov ah, 4Ch
     mov al, 0h
     int 21h
-
-printnumber: ; prints the number in AX register
-    push dx
-    push ax
-    push cx
-    push bx
-
-    mov cx, 16d
-    mov bx, 0 ; stores number of digits
-
-    numberwhileloop:
-        ; divide number by 16 and print remainder in a loop
-        mov dx, 0
-        div cx
-        push dx ; store digits on the stack in reverse order
-        add bx, 1d
-        cmp ax, 0
-        jne numberwhileloop
-
-    ; print the digits
-    mov ah, 02h
-    numberprintloop:
-        ; print digit
-        pop dx
-        add dx, 48d
-        
-        ; if char >57, add 7 to skip to characters
-        cmp dl, 57
-        jle skiphexadd
-        add dl, 7
-        skiphexadd:
-        int 21h
-        sub bx, 1d
-        cmp bx, 0
-        jne numberprintloop
-
-
-
-    pop bx
-    pop cx
-    pop ax
-    pop dx
-    ret
-
-
 
 end start

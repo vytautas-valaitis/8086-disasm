@@ -1,2 +1,5 @@
 ctest/
 comp.bat
+*.EXE
+*.MAP
+*.OBJ
