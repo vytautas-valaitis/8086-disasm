@@ -5,6 +5,7 @@ Dissasembles MS-DOS EXE files.
 ## Usage
 ```bash
 Syntax: disasm [options] input_file_name
+Options:
 -h,-?      Display this help screen.
 -o [name]  Output file name. Defaults to 'ASMOUT.ASM'.
 -a         Output addresses.

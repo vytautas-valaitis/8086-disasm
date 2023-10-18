@@ -2,6 +2,12 @@ locals @@
 .model small
 .stack 200h
 
+; globals
+g_input_buffer_max_size  = 64d
+g_output_buffer_max_size = 64d
+g_label_buffer_max_size  = 64d
+g_file_name_buffer_size = ((9d*3d)+8d+3d+1d) ; 9d*x-folder*depth, 8-name, 3-extension, 1-dot
+
 ; macros
 m_print_string macro string_addr ; prints string at address that ends with $
     push ax
@@ -44,11 +50,6 @@ m_struct_filler macro count ; data filler
     db (count*8d) dup(?)
 endm
 
-; globals
-g_input_buffer_max_size  = 64d
-g_output_buffer_max_size = 64d
-g_file_name_buffer_size = (8d+3d+1d)
-
 .data
 ; registers
 reg_AX db "AX$"
@@ -88,11 +89,12 @@ str_model_point    db ".model small$"
 str_stack_point    db ".stack$"
 str_data_point     db ".data$"
 str_code_point     db ".code$"
-str_entry_point    db "start:$"
+str_entry_point    db "start$"
 str_code_end_point db "end start$"
 str_imm_data_point db "@data$"
 str_byte_ptr       db "byte ptr $"
 str_word_ptr       db "word ptr $"
+str_label          db "label$"
 ; mnemonics
 ins_invalid db "$"
 ins_mov     db "mov$"
@@ -481,6 +483,7 @@ error_file_not_valid        db "ERROR: File is not valid MZ EXE: $"
 ; args
 arg_buffer db 256 dup (?)
 string_help db "Syntax: disasm [options] input_file_name", 0Ah
+db "Options:", 0Ah
 db "-h,-?      Display this help screen.", 0Ah
 db "-o [name]  Output file name. Defaults to 'ASMOUT.ASM'.", 0Ah
 db "-a         Output addresses.", 0Ah
@@ -505,6 +508,9 @@ input_buffer_size dw 0000h
 input_current_index dw 0000h
 output_buffer db g_output_buffer_max_size dup(?)
 output_buffer_size dw 0000h
+label_buffer dw g_label_buffer_max_size dup(?)
+label_buffer_size dw 0000h
+
 ; vars
 var_byte db 00h
 var_word dw 0000h
@@ -517,6 +523,8 @@ var_cs_end       dw 0000h
 var_ds_start     dw 0000h
 var_entry_point  dw 0000h
 var_ds_address   dw 0000h
+var_label_curr_addr dw 0000h ; stores treshold where any addr below does not get added to label
+var_no_more_labels  db 00h
 
 .code
 start:
@@ -911,7 +919,6 @@ input_decode_header proc
     mov [var_cs_end], ax
     @@cs_end_finish:
 
-
     ; code segment start
     m_skip_bytes 2d
     call get_word ; e_cparhdr
@@ -967,6 +974,11 @@ input_decode_header proc
     add ax, [var_cs_start]
     mov [var_ds_start], ax
 
+    ; if data segment is present, cs_end is at ds_start
+    cmp [var_cs_end], ax
+    jb @@no_data
+    mov [var_cs_end], ax
+    @@no_data:
     pop dx cx bx ax
     ret
 input_decode_header endp
@@ -1111,8 +1123,17 @@ dissasemble proc
         jne @@not_entry_point
         lea si, str_entry_point
         call write_dollar_string
+        m_write_char_unsafe ':'
         m_write_char_unsafe 10d ; new-line
         @@not_entry_point:
+
+        ; labels
+        cmp [arg_labels], 0
+        je @@skip_label
+        cmp [var_no_more_labels], 1
+        je @@skip_label
+        call check_for_label
+        @@skip_label:
 
         ; print current addr if no prefix
         cmp [arg_addresses], 0
@@ -1261,6 +1282,169 @@ dissasemble proc
     ret
 dissasemble endp
 
+check_for_label proc
+    cmp [label_buffer_size], 0
+    jne @@skip_extract
+    call extract_labels
+    @@skip_extract:
+
+    push bx ax
+    xor bx, bx
+    @@l:
+        cmp bx, [label_buffer_size]
+        jae @@exit
+
+        ; check if label exists here
+        shl bx, 1
+        mov ax, [label_buffer + bx]
+        shr bx, 1
+        inc bx
+        cmp ax, [var_global_index]
+        jne @@l
+
+        ; print label
+        push si
+        lea si, str_label
+        call write_dollar_string
+        call write_number_word
+        m_write_char_unsafe ':'
+        m_write_char_unsafe 10d ; new-line
+        ; remove label to speed up other searches
+        dec [label_buffer_size]
+        mov si, [label_buffer_size]
+        shl si, 1
+        mov ax, [label_buffer + si]
+        dec bx
+        shl bx, 1
+        mov [label_buffer + bx], ax
+        pop si
+
+    @@exit:
+    pop ax bx
+    ret
+check_for_label endp
+
+extract_labels proc ; at least doubles dissasemble time, because needs to find jumps by dissasembling all over again.
+    push ax bx cx dx di si
+    push [var_global_index]
+
+    mov [label_buffer_size], 0
+    mov dx, [var_global_index]
+    mov [var_label_curr_addr], dx
+    mov dx, [var_cs_start]
+    mov [var_global_index], dx
+    call move_input_file_cursor
+    call get_input_buffer
+
+    ; loop while global index < code end
+    mov di, [var_cs_end]
+    @@whileloop:
+        cmp word ptr [var_global_index], di
+        jb @@skip_exit1
+        jmp @@exit
+        @@skip_exit1:
+ 
+        call get_byte
+        
+        ; check for prefix
+        xor ax, ax
+        mov al, [var_byte]
+        and al, 11100111b
+        cmp al, 00100110b
+        jne @@not_a_prefix
+        jmp @@whileloop
+        @@not_a_prefix:
+
+        ; check if valid opcode
+        xor bx, bx
+        mov bl, [var_byte]
+        shl bx, 3 ; multiply by struct size to access correct instr in lookup table
+        add bx, offset ltable
+        cmp [bx].s_mnemonic, offset ins_invalid
+        ja @@opcode_valid
+        m_print_string error_opc_invalid
+        jmp exit
+        @@opcode_valid:
+
+        ; decode
+        cmp [bx].s_format, f_none
+        je @@format_none
+        cmp [bx].s_format, f_modregrm
+        je @@format_modregrm
+        cmp [bx].s_format, f_dup
+        je @@format_modregrm
+        ; unknown format, exit
+        m_print_string error_opc_invalid
+        jmp exit
+
+       @@format_none:
+            ; op1
+            mov ah, byte ptr [bx].s_op_1
+            call labelextr_decode_f_none
+            cmp byte ptr [bx].s_op_2, t_none
+            jne @@skip_wl_jump1
+            jmp @@whileloop
+            @@skip_wl_jump1:
+            ; op2
+            mov ah, byte ptr [bx].s_op_2
+            call labelextr_decode_f_none
+            jmp @@whileloop
+
+        @@format_modregrm:
+            call get_byte
+
+            mov cl, byte ptr [bx].s_op_1 ; save op_1 to CL
+            mov ch, byte ptr [bx].s_op_2 ; save op_2 to CH
+
+            ; get the mnemonic
+            mov si, [bx].s_mnemonic
+            cmp [bx].s_format, f_dup
+            jne @@not_duplicate_format
+            xor ax, ax
+            mov al, [var_byte] ; addr byte
+            shr al, 2
+            and al, 1110b
+            add si, ax
+            mov si, [si]
+
+            ; make adjustments to edge-case opcodes
+            call adjust_dup_opc_edge_cases
+
+            ; check if valid opcode
+            cmp si, offset ins_invalid
+            ja @@not_duplicate_format
+            m_print_string error_opc_invalid
+            jmp exit
+
+            @@not_duplicate_format:      
+            cmp cl, t_none ; op_1
+            je @@continue
+
+            ; op1
+            mov al, [var_byte] ; addr byte
+            mov ah, cl
+            call labelextr_decode_f_modregrm
+            cmp byte ptr ch, t_none ;op_2
+            je @@continue
+            ; op2
+            mov ah, ch
+            call labelextr_decode_f_modregrm
+        @@continue:
+            jmp @@whileloop
+
+    @@exit:
+    cmp [label_buffer_size], 0
+    jne @@skip_flag
+    mov [var_no_more_labels], 1
+    @@skip_flag:
+    pop [var_global_index]
+    mov dx, [var_global_index]
+    call move_input_file_cursor
+    call get_input_buffer
+    pop si di dx cx bx ax
+    ret
+extract_labels endp
+
 adjust_dup_opc_edge_cases proc ; INPUT: CL=op1, CH=op2, SI=instr
     push ax
     ; ins_test
@@ -1313,49 +1497,72 @@ decode_ins_esc proc ; INPUT: al=addr_byte
 decode_ins_esc endp
 
 decode_labels proc ; INPUT: ah=instr_operand. OUTPUT: dl=0 if nothing found, else dl=1
-    cmp [arg_labels], 0
-    je @@no_labels
+    push si
+    cmp ah, t_label_int
+    je @@type_label_int
+    cmp ah, t_label_ext
+    je @@type_label_ext
+    cmp ah, t_label_int_close
+    je @@type_label_int_close
+    jmp @@exit_none
 
-    @@no_labels:
-        cmp ah, t_label_int
-        je @@type_label_int
-        cmp ah, t_label_ext
-        je @@type_label_ext
-        cmp ah, t_label_int_close
-        je @@type_label_int_close
-        jmp @@exit_none
-
-        @@type_label_int:
-            call get_word
-            mov ax, [var_word]
-            add ax, [var_global_index]
-            call write_number_word
-            jmp @@exit
-        @@type_label_ext:
-            call get_word
-            push cx
-            mov cx, [var_word]
-            call get_word
-            mov ax, [var_word]
-            call write_number_word
-            m_write_char_unsafe ':'
-            mov ax, cx
-            call write_number_word
-            pop cx
-            jmp @@exit
-        @@type_label_int_close:
-            call get_byte
-            mov al, byte ptr [var_byte]
-            cbw
-            add ax, [var_global_index]
-            call write_number_word
-            jmp @@exit        
+    @@type_label_int:
+        call get_word
+        mov ax, [var_word]
+        add ax, [var_global_index]
+        cmp [arg_labels], 0
+        je @@no_label1
+        ; if label is start, print differently
+        cmp ax, [var_entry_point]
+        jne @@print_label1
+        lea si, str_entry_point
+        call write_dollar_string
+        jmp @@exit
+        @@print_label1:
+        lea si, str_label
+        call write_dollar_string
+        @@no_label1:
+        call write_number_word
+        jmp @@exit
+    @@type_label_ext:
+        call get_word
+        push cx
+        mov cx, [var_word]
+        call get_word
+        mov ax, [var_word]
+        call write_number_word
+        m_write_char_unsafe ':'
+        mov ax, cx
+        call write_number_word
+        pop cx
+        jmp @@exit
+    @@type_label_int_close:
+        call get_byte
+        mov al, byte ptr [var_byte]
+        cbw
+        add ax, [var_global_index]
+        cmp [arg_labels], 0
+        je @@no_label2
+        lea si, str_label
+        call write_dollar_string
+        ; if label is start, print differently
+        cmp ax, [var_entry_point]
+        jne @@print_label2
+        lea si, str_entry_point
+        call write_dollar_string
+        jmp @@exit
+        @@print_label2:
+        @@no_label2:
+        call write_number_word
+        jmp @@exit        
 
     @@exit_none:
     xor dl, dl
+    pop si
     ret
     @@exit:
     mov dl, 1
+    pop si
     ret
 decode_labels endp
 
@@ -1571,10 +1778,22 @@ decode_modrm proc ; INPUT: bx=reg_array, ah=rm, al=mod
 
     cmp al, 11b
     je @@get_from_regarr
+
+        cmp bx, offset reg_8
+        je @@size_byte
+        ; else size_word
+            lea si, str_word_ptr
+            call write_dollar_string
+            jmp @@skip_size_byte
+        @@size_byte:
+            lea si, str_byte_ptr
+            call write_dollar_string
+        @@skip_size_byte:
+        call get_prefix
+
     cmp al, 00b
     je @@get_from_00
     ; else
-        call get_prefix
         push ax ; keep for mod check later
         m_write_char_unsafe '['
         lea bx, rm_mod
@@ -1609,7 +1828,6 @@ decode_modrm proc ; INPUT: bx=reg_array, ah=rm, al=mod
     @@get_from_00:
         cmp ah, 110b
         je @@direct_addr
-            call get_prefix
             m_write_char_unsafe '['
             lea bx, rm_mod
             shl ah, 1
@@ -1619,18 +1837,6 @@ decode_modrm proc ; INPUT: bx=reg_array, ah=rm, al=mod
             m_write_char_unsafe ']'
             jmp @@exit
         @@direct_addr:
-            cmp bx, offset reg_8
-            je @@size_byte
-            ; else size_word
-                lea si, str_word_ptr
-                call write_dollar_string
-                jmp @@skip_size_byte
-            @@size_byte:
-                lea si, str_byte_ptr
-                call write_dollar_string
-            @@skip_size_byte:
-
-            call get_prefix
             m_write_char_unsafe '['
             call get_word
             mov ax, [var_word]
@@ -1642,6 +1848,196 @@ decode_modrm proc ; INPUT: bx=reg_array, ah=rm, al=mod
     pop si bx ax
     ret
 decode_modrm endp
+
+labelextr_add_label proc ; INPUT: ax=addr
+    push cx dx bx si
+
+    ; if bellow threshold skip
+    cmp ax, [var_label_curr_addr]
+    jb @@exit
+
+    ; if entry point, skip
+    cmp ax, [var_entry_point]
+    je @@exit
+
+    ; if already exists, exit
+    xor si, si
+    @@l1:
+        cmp si, [label_buffer_size]
+        jae @@break1
+        shl si, 1
+        cmp ax, [label_buffer + si]
+        je @@exit
+        shr si, 1
+        inc si
+        jmp @@l1
+    @@break1:
+
+    ; if theres space, add it
+    cmp [label_buffer_size], g_label_buffer_max_size
+    jae @@try_to_add
+    mov bx, [label_buffer_size]
+    shl bx, 1
+    mov [label_buffer + bx], ax
+    inc [label_buffer_size]
+    jmp @@exit
+    @@try_to_add:
+    ; if no space, find biggest one and overwrite if bigger than currently found
+    xor bx, bx ; stores max index
+    mov dx, [label_buffer] ; stores max value
+    xor si, si
+    xor cx, cx ; if 1, replace label
+    @@l2:
+        cmp si, [label_buffer_size]
+        jae @@break2
+        shl si, 1
+        cmp ax, [label_buffer + si]
+        jae @@continue
+        ; if found bigger check for max
+        cmp [label_buffer + si], dx
+        jb @@continue
+        ; save max
+        mov dx, [label_buffer + si]
+        mov bx, si
+        mov cx, 1
+
+        @@continue:
+        shr si, 1
+        inc si
+        jmp @@l2
+    @@break2:
+    cmp cx, 0
+    je @@exit
+    mov [label_buffer + bx], ax
+
+    @@exit:
+    pop si bx dx cx
+    ret
+labelextr_add_label endp
+
+labelextr_decode_labels proc ; INPUT: ah=instr_operand. OUTPUT: dl=0 if nothing found, else dl=1
+    cmp ah, t_label_int
+    je @@type_label_int
+    cmp ah, t_label_ext
+    je @@type_label_ext
+    cmp ah, t_label_int_close
+    je @@type_label_int_close
+    xor dl, dl
+    ret
+
+    @@type_label_int:
+        call get_word
+        mov ax, [var_word]
+        add ax, [var_global_index]
+        call labelextr_add_label
+        jmp @@exit
+    @@type_label_ext:
+        call get_word
+        call get_word
+        jmp @@exit
+    @@type_label_int_close:
+        call get_byte
+        mov al, byte ptr [var_byte]
+        cbw
+        add ax, [var_global_index]
+        call labelextr_add_label
+
+    @@exit:
+    mov dl, 1
+    ret
+labelextr_decode_labels endp
+
+labelextr_decode_repeating_types proc ; INPUT: ah=instr_operand. OUTPUT: dl=0 if nothing found, else dl=1
+    call labelextr_decode_labels
+    cmp dl, 1
+    je @@exit
+
+    cmp ah, t_imm8
+    je @@type_imm8
+    cmp ah, t_imm16
+    je @@type_imm16
+    xor dl, dl
+    ret
+
+    @@type_imm8:
+        call get_byte
+        jmp @@exit
+    @@type_imm16:
+        call get_word
+
+    @@exit:
+    mov dl, 1
+    ret
+labelextr_decode_repeating_types endp
+
+labelextr_decode_f_none proc ; INPUT: ah=instr_operand
+    push ax dx
+
+    call labelextr_decode_repeating_types
+    cmp dl, 1
+    je @@exit
+
+    cmp ah, t_addr8
+    je @@read_word
+    cmp ah, t_addr16
+    jne @@exit
+    @@read_word:
+        call get_word
+
+    @@exit:
+    pop dx ax
+    ret
+labelextr_decode_f_none endp
+
+labelextr_decode_f_modregrm proc ; INPUT: ah=instr_operand, al=addr_byte
+    push ax dx
+
+    call labelextr_decode_repeating_types
+    cmp dl, 1
+    je @@exit
+
+    cmp ah, t_modrm8
+    je @@decode
+    cmp ah, t_modrm16
+    jne @@exit
+    @@decode:
+        mov ah, al
+        and ah, 111b ; rm
+        shr al, 6 ; mod
+        call labelextr_decode_modrm
+
+    @@exit:
+    pop dx ax
+    ret
+labelextr_decode_f_modregrm endp
+
+labelextr_decode_modrm proc ; ah=rm, al=mod
+    push ax
+
+    cmp al, 11b
+    je @@exit
+    cmp al, 00b
+    je @@get_from_00
+    ; else
+        cmp al, 10b
+        je @@get_word
+        ; else get_byte
+            call get_byte
+            jmp @@exit
+        @@get_word:
+            call get_word
+            jmp @@exit
+
+    @@get_from_00:
+        cmp ah, 110b
+        jne @@exit
+        call get_word
+        jmp @@exit
+
+    @@exit:
+    pop ax
+    ret
+labelextr_decode_modrm endp
 
 check_data_addr proc ; INPUT: dx=bytes_offset. OUTPUT: dl=0 if is not data, dl=1 if is data
     push ax si
@@ -1817,6 +2213,7 @@ write_number_decimal proc ; INPUT: AX=number
 write_number_decimal endp
 
 exit:
+    call file_print
     mov bx, [input_file_handle]
     call close_file
     mov bx, [output_file_handle]
@@ -1824,5 +2221,50 @@ exit:
     mov ah, 4Ch
     mov al, 0h
     int 21h
+
+printnumber: ; prints the number in AX register
+    push dx
+    push ax
+    push cx
+    push bx
+
+    mov cx, 16d
+    mov bx, 0 ; stores number of digits
+
+    numberwhileloop:
+        ; divide number by 16 and print remainder in a loop
+        mov dx, 0
+        div cx
+        push dx ; store digits on the stack in reverse order
+        add bx, 1d
+        cmp ax, 0
+        jne numberwhileloop
+
+    ; print the digits
+    mov ah, 02h
+    numberprintloop:
+        ; print digit
+        pop dx
+        add dx, 48d
+        
+        ; if char >57, add 7 to skip to characters
+        cmp dl, 57
+        jle skiphexadd
+        add dl, 7
+        skiphexadd:
+        int 21h
+        sub bx, 1d
+        cmp bx, 0
+        jne numberprintloop
+
+
+
+    pop bx
+    pop cx
+    pop ax
+    pop dx
+    ret
+
+
 
 end start
