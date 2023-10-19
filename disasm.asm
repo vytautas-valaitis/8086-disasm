@@ -3,8 +3,10 @@ locals @@
 .stack 200h
 
 ; globals
-g_input_buffer_max_size  = 64d
-g_output_buffer_max_size = 64d
+g_input_buffer_max_size  = 128d
+g_output_buffer_max_size = 512d
+g_output_subbuffer_max_size = 128d
+g_ins_byte_buffer_max_size = 8d
 g_label_buffer_max_size  = 64d
 g_file_name_buffer_size = ((9d*3d)+8d+3d+1d) ; 9d*x-folder*depth, 8-name, 3-extension, 1-dot
 
@@ -490,6 +492,7 @@ db "-o [name]  Output file name. Defaults to 'ASMOUT.ASM'.", 0Ah
 db "-a         Output addresses.", 0Ah
 db "-c         Output code segment only.", 0Ah
 db "-l         Output generated labels.", 0Ah
+db "-p         Output instruction bytes.", 0Ah
 db "-n         Remove NOP that is generated after JMP. Use if JMP is out of range for this reason.", 0Ah
 db "-d         Output numbers in decimal.", 0Ah
 string_endl_dollar db 0Dh, 0Ah, 24h
@@ -498,6 +501,7 @@ arg_code_only db 0
 arg_labels    db 0
 arg_use_dec   db 0
 arg_jmp_nop   db 0
+arg_ins_bytes db 0
 error_opc_invalid db "ERROR: Invalid instruction.$"
 error_args_no_input_file   db "ERROR: No input file passed.$"
 error_args_no_output_file  db "ERROR: No output file passed.$"
@@ -506,13 +510,17 @@ error_args_after_input     db "ERROR: Args after input file name.$"
 error_args_unknown         db "ERROR: Unknown argument: $"
 
 ; buffers
-input_buffer db g_input_buffer_max_size dup(?)
-input_buffer_size dw 0000h
-input_current_index dw 0000h
-output_buffer db g_output_buffer_max_size dup(?)
-output_buffer_size dw 0000h
-label_buffer dw g_label_buffer_max_size dup(?)
-label_buffer_size dw 0000h
+input_buffer          db g_input_buffer_max_size dup(?)
+input_buffer_size     dw 0000h
+input_current_index   dw 0000h
+output_buffer         db g_output_buffer_max_size dup(?)
+output_buffer_size    dw 0000h
+output_subbuffer      db g_output_subbuffer_max_size dup(?)
+output_subbuffer_size dw 0000h
+ins_byte_buffer       db g_ins_byte_buffer_max_size dup(?)
+ins_byte_buffer_size  dw 0000h
+label_buffer          dw g_label_buffer_max_size dup(?)
+label_buffer_size     dw 0000h
 
 ; vars
 var_byte db 00h
@@ -528,6 +536,7 @@ var_entry_point  dw 0000h
 var_ds_address   dw 0000h
 var_label_curr_addr dw 0000h ; stores treshold where any addr below does not get added to label
 var_no_more_labels  db 00h
+var_use_subbuffer   db 00h
 
 .code
 start:
@@ -568,21 +577,41 @@ decode_arg proc
 
     ; check args
     cmp al, 'h'
-    je @@arg_help
+    jne @@arg_help_skip1
+    jmp @@arg_help
+    @@arg_help_skip1:
     cmp al, '?'
-    je @@arg_help
+    jne @@arg_help_skip2
+    jmp @@arg_help
+    @@arg_help_skip2:
     cmp al, 'o'
-    je @@arg_output_file
+    jne @@arg_output_file_skip
+    jmp @@arg_output_file
+    @@arg_output_file_skip:
     cmp al, 'a'
-    je @@arg_output_addr
+    jne @@arg_output_addr_skip
+    jmp @@arg_output_addr
+    @@arg_output_addr_skip:
     cmp al, 'c'
-    je @@arg_code_only
+    jne @@arg_code_only_skip
+    jmp @@arg_code_only
+    @@arg_code_only_skip:
     cmp al, 'l'
-    je @@arg_labels
+    jne @@arg_labels_skip
+    jmp @@arg_labels
+    @@arg_labels_skip:
+    cmp al, 'p'
+    jne @@arg_ins_bytes_skip
+    jmp @@arg_ins_bytes
+    @@arg_ins_bytes_skip:
     cmp al, 'n'
-    je @@arg_jmp_nop
+    jne @@arg_jmp_nop_skip
+    jmp @@arg_jmp_nop
+    @@arg_jmp_nop_skip:
     cmp al, 'd'
-    je @@arg_use_dec
+    jne @@arg_use_dec_skip
+    jmp @@arg_use_dec
+    @@arg_use_dec_skip:
 
     @@unknown_option:
     m_print_string error_args_unknown
@@ -610,6 +639,9 @@ decode_arg proc
         jmp @@check_next_arg
     @@arg_labels:
         mov [arg_labels], 1
+        jmp @@check_next_arg
+    @@arg_ins_bytes:
+        mov [arg_ins_bytes], 1
         jmp @@check_next_arg
     @@arg_jmp_nop:
         mov [arg_jmp_nop], 1
@@ -856,6 +888,12 @@ get_byte proc
     mov [var_byte], al
     inc word ptr [input_current_index]
     inc word ptr [var_global_index]
+    ; move byte to ins bytes
+    cmp word ptr [ins_byte_buffer_size], g_ins_byte_buffer_max_size
+    jae @@exit
+    mov si, word ptr [ins_byte_buffer_size]
+    mov byte ptr [ins_byte_buffer + si], al
+    inc word ptr [ins_byte_buffer_size]
     @@exit:
     pop si ax
     ret
@@ -1118,11 +1156,15 @@ dissasemble proc
     @@skip_code_start:
 
     ; loop while global index < code end
+    mov [ins_byte_buffer_size], 0
     mov di, [var_cs_end]
     @@whileloop:
         cmp word ptr [var_global_index], di
-        jae @@break_relative_range1
+        jb @@no_break
+        jmp @@break
+        @@no_break:
 
+        mov [var_use_subbuffer], 0
         ; check for entry point
         cmp [arg_code_only], 0
         jne @@not_entry_point
@@ -1154,6 +1196,7 @@ dissasemble proc
         m_write_char_unsafe ' '
         @@skip_addr_write:
 
+        mov [var_use_subbuffer], 1
         call get_byte
 
         ; remove NOP after close JMP
@@ -1166,11 +1209,6 @@ dissasemble proc
         mov byte ptr [var_opc_byte], 0 ; reset so this does not remove any more NOPs
         jmp @@whileloop
         @@skip_jmp_nop:
-
-        jmp @@skip_break
-        @@break_relative_range1: ; fix for jump out of range
-        jmp @@break_relative_range2
-        @@skip_break:
 
         ; check for prefix
         xor ax, ax
@@ -1214,9 +1252,6 @@ dissasemble proc
         ; unknown format, exit
         m_print_string error_opc_invalid
         jmp exit
-
-        @@break_relative_range2: ; fix for jump out of range
-        jmp @@break
 
         @@format_none:
             ; print the mnemonic
@@ -1287,6 +1322,12 @@ dissasemble proc
 
         @@continue:
             m_write_char 10d ; new line
+            mov [var_use_subbuffer], 0
+            cmp [arg_ins_bytes], 1
+            jne @@no_ins_bytes
+            call write_ins_bytes
+            @@no_ins_bytes:
+            call write_subbuffer
         jmp @@whileloop
 
     @@break:
@@ -1345,6 +1386,7 @@ check_for_label endp
 
 extract_labels proc ; at least doubles dissasemble time, because needs to find jumps by dissasembling all over again.
     push ax bx cx dx di si
+    push [ins_byte_buffer_size]
     push [var_global_index]
 
     mov [label_buffer_size], 0
@@ -1457,6 +1499,7 @@ extract_labels proc ; at least doubles dissasemble time, because needs to find j
     mov [var_no_more_labels], 1
     @@skip_flag:
     pop [var_global_index]
+    pop [ins_byte_buffer_size]
     mov dx, [var_global_index]
     call move_input_file_cursor
     call get_input_buffer
@@ -2091,15 +2134,76 @@ check_data_addr proc ; INPUT: dx=bytes_offset. OUTPUT: dl=0 if is not data, dl=1
     ret
 check_data_addr endp
 
+write_ins_bytes proc
+    push ax bx
+    xor bx, bx
+    @@l:
+        cmp bx, word ptr [ins_byte_buffer_size]
+        jae @@skip_numbers
+        ; don't use 'write_number_byte' to skip added stuff
+        mov al, byte ptr [ins_byte_buffer + bx]
+        shr al, 4
+        call write_single_hex_digit
+        mov al, byte ptr [ins_byte_buffer + bx]
+        and al, 1111b
+        call write_single_hex_digit
+        m_write_char_unsafe ' '
+        inc bx
+        jmp @@l
+        @@skip_numbers:
+        cmp bx, g_ins_byte_buffer_max_size
+        jae @@l_break
+        m_write_char_unsafe ' '
+        m_write_char_unsafe ' '
+        m_write_char_unsafe ' '
+        inc bx
+        jmp @@l
+    @@l_break:
+    mov [ins_byte_buffer_size], 0
+    pop bx ax
+    ret
+write_ins_bytes endp
+
+write_subbuffer proc
+    push ax bx
+    xor bx, bx
+    @@l:
+        cmp bx, word ptr [output_subbuffer_size]
+        jae @@l_break
+        mov al, byte ptr [output_subbuffer + bx]
+        call write_char
+        inc bx
+        jmp @@l
+    @@l_break:
+    mov [output_subbuffer_size], 0
+    pop bx ax
+    ret
+write_subbuffer endp
+
 write_char proc ; writes char to output buffer. INPUT: al=byte_to_write
     push bx
-    cmp [output_buffer_size], g_output_buffer_max_size
-    jb @@continue_writing
-    call file_print
-    @@continue_writing:
-    mov bx, [output_buffer_size]
-    mov byte ptr [output_buffer + bx], al
-    inc [output_buffer_size]
+    ; check which buffer
+    cmp [var_use_subbuffer], 1
+    jne @@not_subbuffer
+        cmp [output_subbuffer_size], g_output_subbuffer_max_size
+        jb @@continue_writing_sub
+        mov [output_subbuffer_size], 0
+        @@continue_writing_sub:
+        mov bx, [output_subbuffer_size]
+        mov byte ptr [output_subbuffer + bx], al
+        inc word ptr [output_subbuffer_size]
+        jmp @@exit
+
+    @@not_subbuffer:
+        cmp [output_buffer_size], g_output_buffer_max_size
+        jb @@continue_writing
+        call file_print
+        @@continue_writing:
+        mov bx, [output_buffer_size]
+        mov byte ptr [output_buffer + bx], al
+        inc word ptr [output_buffer_size]
+        
+    @@exit:
     pop bx
     ret
 write_char endp
@@ -2118,6 +2222,18 @@ write_dollar_string proc ; writes string terminated by $ to output buffer. INPUT
     ret
 write_dollar_string endp
 
+write_single_hex_digit proc ; input AL=half-byte
+    push ax
+    add al, '0'
+    cmp al, '9'
+    jbe @@in_hex
+    add al, 7
+    @@in_hex:
+    call write_char
+    pop ax
+    ret
+write_single_hex_digit endp
+
 write_number_internal proc ; INPUT: AL=half-byte. CH=1 if there were no chars before. CL=1 to prepend zeros.
     ; if CL=1, skip skipping
     cmp cl, 1
@@ -2131,17 +2247,13 @@ write_number_internal proc ; INPUT: AL=half-byte. CH=1 if there were no chars be
 
     ; make to hex
     @@make_hex:
-    add al, '0'
-    cmp al, '9'
-    jbe @@in_hex
-    add al, 7
     ; if it is first char, print 0 behind it
     cmp ch, 1
-    jne @@in_hex
+    jne @@dont_print
     m_write_char '0'
-    @@in_hex:
+    @@dont_print:
     xor ch, ch
-    call write_char
+    call write_single_hex_digit
 
     @@exit:
     ret
