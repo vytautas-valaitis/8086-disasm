@@ -63,6 +63,7 @@ start:
     ; push1
     push [TT+5]
     push ss:[16]
+    push 15h
     ; push2
     push bx
     ; push3

@@ -97,6 +97,7 @@ str_imm_data_point db "@data$"
 str_byte_ptr       db "byte ptr $"
 str_word_ptr       db "word ptr $"
 str_label          db "label$"
+str_ds_start       db "ds_start $"
 ; mnemonics
 ins_invalid db "$"
 ins_mov     db "mov$"
@@ -1089,6 +1090,13 @@ dissasemble proc
     lea si, str_data_point
     call write_dollar_string
     m_write_char_unsafe 10d ; new-line
+    ; print str_ds_start
+    lea si, str_label
+    call write_dollar_string
+    m_write_char_unsafe ' '
+    lea si, str_ds_start
+    call write_dollar_string
+    m_write_char_unsafe 10d ; new-line
 
     ; loop while buffer_size == max_buffer_size || buffer_index < buffer_size
     xor cx, cx
@@ -1328,6 +1336,7 @@ dissasemble proc
             call write_ins_bytes
             @@no_ins_bytes:
             call write_subbuffer
+            mov [var_prefix], 0FFFFh ; clear prefix
         jmp @@whileloop
 
     @@break:
@@ -1528,24 +1537,29 @@ adjust_dup_opc_edge_cases endp
 get_prefix proc
     push bx si
     cmp [var_prefix], 0FFFFh
-    je @@no_prefix
+    je @@exit
     lea bx, reg_s
     add bx, [var_prefix]
     mov si, [bx]
-    call write_dollar_string
-    m_write_char ':'
-    mov [var_prefix], 0FFFFh
-    jmp @@exit
-    @@no_prefix:
-    cmp [arg_code_only], 0
-    jne @@exit
-    lea si, reg_DS
     call write_dollar_string
     m_write_char ':'
     @@exit:
     pop si bx
     ret
 get_prefix endp
+
+print_dummy_addr_label proc ; prints str_ds_start to compile as address instead of constant
+    cmp [var_prefix], 0FFFFh
+    jne @@exit
+    push ax si
+    lea si, str_ds_start
+    call write_dollar_string
+    m_write_char_unsafe '+'
+    m_write_char_unsafe ' '
+    pop si ax
+    @@exit:
+    ret
+print_dummy_addr_label endp
 
 decode_ins_esc proc ; INPUT: al=addr_byte
     mov ah, [var_opc_byte]
@@ -1736,6 +1750,7 @@ decode_f_none proc ; INPUT: ah=instr_operand
         call write_dollar_string
         call get_prefix
         m_write_char_unsafe '['
+        call print_dummy_addr_label
         call get_word
         mov ax, [var_word]
         call write_number_word
@@ -1746,6 +1761,7 @@ decode_f_none proc ; INPUT: ah=instr_operand
         call write_dollar_string
         call get_prefix
         m_write_char_unsafe '['
+        call print_dummy_addr_label
         call get_word
         mov ax, [var_word]
         call write_number_word
@@ -1918,6 +1934,7 @@ decode_modrm proc ; INPUT: bx=reg_array, ah=rm, al=mod
             jmp @@exit
         @@direct_addr:
             m_write_char_unsafe '['
+            call print_dummy_addr_label
             call get_word
             mov ax, [var_word]
             call write_number_word
