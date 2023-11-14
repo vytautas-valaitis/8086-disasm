@@ -27,6 +27,10 @@ start:
     mov [TT+5], bx
     mov byte ptr [TT-5], bl
     mov cs:[45], cx
+    mov al, byte ptr [bx-1]
+    mov cx, word ptr [si-4]
+    mov al, byte ptr [bx+1]
+    mov cx, word ptr [si+4]
     ; mov2
     mov [TT], 1234h
     mov byte ptr [TT+5], 34h

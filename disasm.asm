@@ -1872,18 +1872,27 @@ decode_modrm proc ; INPUT: bx=reg_array, ah=rm, al=mod
         add bl, ah
         mov si, [bx]
         call write_dollar_string
-        m_write_char_unsafe '+'
         pop ax
         cmp al, 10b
         je @@get_word
         ; else get_byte
             call get_byte
             mov al, [var_byte]
+            cbw
+            cmp ah, 0
+            je @@no_minus
+            not al
+            inc al
+            mov ah, 2
+            @@no_minus:
+            add ah, 43d
+            m_write_char ah
             call write_number_byte
             jmp @@finish
         @@get_word:
             call get_word
             mov ax, [var_word]
+            m_write_char '+'
             call write_number_word
         @@finish:
         m_write_char_unsafe ']'
