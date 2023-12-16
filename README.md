@@ -1,3 +1,9 @@
+# About
+
+2023 metų Kompiuterių Architektūra, MIF, VU.
+
+Studento atsiskaitytas darbas.
+
 # 8086-disasm  
 
 Dissasembles MS-DOS EXE files.  
